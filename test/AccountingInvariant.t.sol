@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {HookFixture} from "./HookFixture.sol";
+import {GoldenCrossHook} from "../src/GoldenCrossHook.sol";
+import {Swapper} from "./mocks/Swapper.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+
+contract AccountingHandler is Test {
+    GoldenCrossHook private immutable hook;
+    Swapper private immutable router;
+    PoolKey private key;
+    mapping(Currency => uint256) public accrued;
+    mapping(Currency => uint256) public redeemed;
+
+    constructor(GoldenCrossHook hook_, Swapper router_, PoolKey memory key_) {
+        hook = hook_;
+        router = router_;
+        key = key_;
+        accrued[key.currency0] = hook.creatorFees(key.currency0) + hook.accumulatorFees(key.currency0);
+        accrued[key.currency1] = hook.creatorFees(key.currency1) + hook.accumulatorFees(key.currency1);
+    }
+
+    function swap(uint96 amount, bool zeroForOne, bool exactOutput) external {
+        Currency output = zeroForOne ? key.currency1 : key.currency0;
+        uint256 beforeFee = hook.creatorFees(output) + hook.accumulatorFees(output);
+        uint256 specified = bound(amount, 1e10, 1e21);
+        BalanceDelta net = exactOutput
+            ? router.swapWithParams(
+                key,
+                SwapParams(
+                    zeroForOne,
+                    int256(specified),
+                    zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+                )
+            )
+            : router.swap(key, zeroForOne, specified);
+        uint256 fee = hook.creatorFees(output) + hook.accumulatorFees(output) - beforeFee;
+        uint256 netOut = uint256(uint128(zeroForOne ? net.amount1() : net.amount0()));
+        if (exactOutput) assertEq(netOut, specified);
+        assertEq(fee, (netOut + fee) * 25 / 10000);
+        accrued[output] += fee;
+    }
+
+    function redeem(bool currency0, bool forCreator) external {
+        Currency currency = currency0 ? key.currency0 : key.currency1;
+        uint256 amount = forCreator ? hook.creatorFees(currency) : hook.accumulatorFees(currency);
+        if (amount == 0) return;
+        hook.redeemFees(currency, forCreator);
+        redeemed[currency] += amount;
+    }
+}
+
+contract AccountingInvariantTest is HookFixture {
+    AccountingHandler private handler;
+
+    function setUp() public override {
+        super.setUp();
+        _configure();
+        _warmupFlat();
+        token0.mint(address(hook), 1e18);
+        token1.mint(address(hook), 1e18);
+        handler = new AccountingHandler(hook, router, key);
+        bytes4[] memory selectors = new bytes4[](2);
+        selectors[0] = handler.swap.selector;
+        selectors[1] = handler.redeem.selector;
+        targetSelector(FuzzSelector(address(handler), selectors));
+        targetContract(address(handler));
+    }
+
+    function invariant_allDeltasAreSettledAndClaimsMatchLiabilities() public view {
+        _assertSettled();
+        _assertClaims(key.currency0);
+        _assertClaims(key.currency1);
+    }
+
+    function invariant_tokensAreConservedAcrossAllParticipants() public view {
+        assertEq(
+            token0.totalSupply(),
+            token0.balanceOf(address(router)) + token0.balanceOf(address(manager))
+                + token0.balanceOf(address(hook)) + token0.balanceOf(creator) + token0.balanceOf(accumulator)
+        );
+        assertEq(
+            token1.totalSupply(),
+            token1.balanceOf(address(router)) + token1.balanceOf(address(manager))
+                + token1.balanceOf(address(hook)) + token1.balanceOf(creator) + token1.balanceOf(accumulator)
+        );
+    }
+
+    function _assertClaims(Currency currency) private view {
+        uint256 liability = hook.creatorFees(currency) + hook.accumulatorFees(currency);
+        assertEq(manager.balanceOf(address(hook), currency.toId()), liability);
+        assertEq(handler.accrued(currency) - handler.redeemed(currency), liability);
+        assertGe(currency.balanceOf(address(manager)), liability);
+    }
+}

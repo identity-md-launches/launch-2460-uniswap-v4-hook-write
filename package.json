@@ -1,0 +1,13 @@
+{
+  "name": "golden-cross-hook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Uniswap v4 golden-cross hook with vendored offline build dependencies",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "compile": "node tools/hardhat.cjs compile",
+    "test": "forge test",
+    "check": "forge build && forge test && forge fmt --check && node tools/hardhat.cjs compile"
+  }
+}
