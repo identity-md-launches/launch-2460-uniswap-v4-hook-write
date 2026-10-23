@@ -1,12 +1,17 @@
-# Golden Cross and Bollinger Hooks
+# Golden Cross, Bollinger and RSI Hooks
 
-Two standalone Uniswap v4 hooks for Robinhood Chain (chain ID **4663**):
-[`GoldenCrossHook`](contracts/GoldenCrossHook.sol) and [`BollingerHook`](contracts/BollingerHook.sol).
+Three standalone Uniswap v4 hooks for Robinhood Chain (chain ID **4663**):
+[`GoldenCrossHook`](contracts/GoldenCrossHook.sol), [`BollingerHook`](contracts/BollingerHook.sol),
+and [`RSIHook`](contracts/RSIHook.sol).
 Each creates no token, pool, LP position, or depositor shares. The canonical implementations live in
 `contracts/`; import-only entry points in `src/` preserve the existing Foundry and Hardhat source
 roots without changing build configuration. There is one implementation and artifact per contract.
-Bollinger does not inherit GoldenCross or combine its signal with another indicator.
+Bollinger and RSI do not inherit GoldenCross or combine signals with another indicator.
 Mock tokens and a prefunded router live only in `test/`.
+
+The RSI addition is documented in [docs/RSI.md](docs/RSI.md), including its 14-period Wilder math,
+threshold behavior, deployment arguments, operational responsibilities and verification results.
+Golden Cross and Bollinger implementations are unchanged by this addition.
 
 ## Build and check offline
 
@@ -24,10 +29,10 @@ npx hardhat compile
 
 `foundry.toml` pins the compiler, optimizer settings, and the existing project's fuzz seed:
 `0x44c026aa94cf1f7f2d350042e578dcc53619d1c45a9e548e855f975dba844cc4`.
-The additional requested seed is checked with:
+The additional seed supplied for the RSI assignment is checked with:
 
 ```sh
-forge test --offline --fuzz-seed 0x3a3258c3e9f8de3561577610cf566781b3afb476ac8a6593a22ac57d0a0fba7a
+forge test --fuzz-seed 0x6bd9a8ed6933fd9ca8a8a6fed4d31a2dbe35df13b0765f8169db049e785613de
 ```
 
 Tests do not use RPCs, environment variables, FFI, or filesystem cheatcode permissions. Stateful
@@ -112,17 +117,33 @@ are uint256 because an upper band may exceed uint160, and a negative lower band 
 - Like Golden Cross, histories are isolated by full PoolId; zero-output swaps, liquidity actions,
   initialization, and the hook's own trades are not observations.
 
+## RSI signal
+
+[`SwapRSI`](contracts/libraries/SwapRSI.sol) seeds Wilder's averages with **14 price changes
+(15 observations)**, then updates each average as `(13 * previousAverage + newChange) / 14`.
+It uses the same per-swap `sqrtPriceX96` observations as the other hooks. RSI strictly above 70
+sells token0 toward lower; RSI strictly below 30 sells token1 toward upper. The inclusive 30–70
+interval is neutral. There is no additional EWMA, combined indicator, governor, ratchet or phase flip.
+
+This is a condition on **every** ready observation, including the first full RSI. Remaining outside
+a threshold can trade newly funded inventory again. A new neutral observation cancels a pending
+RSI trade; an opposite condition replaces it. `rsi(poolId)` returns the displayed RSI in hundredths
+of a point, seed-change count (ready at 14), observation count and direction. See the
+[RSI guide](docs/RSI.md) for flat histories, precision and execution details.
+
 ## Shared rebalance execution
 
 The strategy attempts to sell the entire available balance in the signaled input currency. It uses
 an exact-input `poolManager.swap` inside the already-open unlock. Core suppresses a hook's callbacks
 on its own swaps, so rebalances have no recursive observation or hook fee. The pool's normal LP fee
-still applies. Proceeds stay in the hook for a later reverse crossover.
+still applies. Proceeds stay in the hook for a later reverse signal.
 
 Both absolute square-root price limits must be configured. A partial fill pays only actual input,
-retains unused input, and leaves the direction pending. A pending direction is retried on later
-volume swaps in that pool or by `retryRebalance()`. An opposite crossover replaces it. A successful
-full sale, or an empty input balance, clears it; new funding alone does not recreate a cleared signal.
+retains unused input, and leaves the direction pending. A pending direction is retried by
+`retryRebalance()` or on later volume swaps in that pool. Golden Cross and Bollinger retain the
+direction until an opposite crossover; RSI refreshes it on each observation and cancels it when
+neutral. A successful full sale, or an empty input balance, clears it. New funding alone does not
+trade; RSI can trade it on the next observation meeting a threshold, while the other hooks need a new cross.
 Amounts exceeding `int128.max` are sold in bounded chunks, with the rest remaining pending.
 
 An automatic attempt runs in an authenticated external self-call. An ordinary swap/settlement
@@ -176,14 +197,14 @@ That function cannot withdraw the fee claims. Do not send unrelated ERC-6909 cla
 
 ## Deployment parameters
 
-Both constructors have exactly six arguments, in this order:
+All three constructors have exactly six arguments, in this order:
 
 | Argument | Purpose and responsibility |
 | --- | --- |
 | `IPoolManager manager` | The verified v4 PoolManager for chain 4663; immutable. |
 | `address gasWallet` | Recorded operational wallet expected to pay for redemptions/retries; no special authority or automatic reimbursement. |
 | `address accumulator` | Immutable beneficiary of the 25-bps flywheel fee and all recovered strategy capital. |
-| `address governanceTreasury` | Immutable administrative authority for pool selection, price limits, and recovery to the accumulator. Prefer an operational multisig. |
+| `address treasury` (`governanceTreasury` in Golden Cross/Bollinger) | Immutable operational authority for pool selection, price limits, and recovery to the accumulator. |
 | `address creatorWallet` | Immutable beneficiary of the 17-bps fee. |
 | `address charityRouter` | Immutable beneficiary of the 3-bps charity fee; responsible for onward distribution. |
 
@@ -194,7 +215,7 @@ upgrade mechanism. Construction does not call outside contracts or require deplo
 never comes from `msg.sender` or `tx.origin`; a factory gains no administrative rights.
 
 **PoolManager input:** the task's `0x8366a39cc670b4001a1121b8f6a443e40951` contains only 36 hex
-digits and is not a valid 20-byte address. It has not been padded, guessed, or embedded in either hook.
+digits and is not a valid 20-byte address. It has not been padded, guessed, or embedded in any hook.
 PoolManager is an explicit constructor input, so this source-only task can be completed without
 inventing a deployment value. Before deployment, the operator must obtain the intended full address
 from the requester/official chain deployment record and verify chain ID 4663, code, and contract
@@ -216,7 +237,8 @@ predicted hook address, salt, and init-code hash using periphery's `HookMiner`. 
 real deployment addresses. It reads no keys or environment and never broadcasts.
 
 [`script/MineBollingerHook.s.sol`](script/MineBollingerHook.s.sol) provides the same interface for
-Bollinger. An operator can dry-run either miner without a key or broadcast:
+Bollinger; [`script/MineRSIHook.s.sol`](script/MineRSIHook.s.sol) provides it for RSI. An operator can
+dry-run a miner without a key or broadcast:
 
 ```sh
 forge script script/MineBollingerHook.s.sol:MineBollingerHook \
@@ -237,7 +259,8 @@ the hook with its returned salt. This repository has no launch manifest and broa
 
 1. An external operator initializes/provides liquidity to the intended pool. This project supplies
    the hook only. The hook does not restrict which factory calls initialization through PoolManager.
-2. The `governanceTreasury` calls `configureStrategy(PoolKey, sell0LimitX96, sell1LimitX96)` once.
+2. The treasury (`treasury` in RSI, `governanceTreasury` in the other hooks) calls
+   `configureStrategy(PoolKey, sell0LimitX96, sell1LimitX96)` once.
    Obtain the full key from the intended pool's on-chain `Initialize` event/official pool record;
    it includes both ordered currencies, fee, tick spacing, and this hook address. It must already
    be initialized. Neither first use nor an attacker can select the strategy pool. Rebinding is
@@ -250,7 +273,8 @@ the hook with its returned salt. This repository has no launch manifest and broa
 4. Fund the hook with the intended strategy balances only after checking the pool and limits.
    Funding is irrevocably subject to the strategy and treasury's fixed-destination recovery power.
    Golden Cross needs 200 observations and Bollinger needs 20 to establish a baseline; only a subsequent crossing trades.
-5. Monitor `CrossDetected` / `BandCrossDetected`, `Rebalanced`, `RebalanceDeferred`, pending direction, inventory, and fee
+   RSI first becomes eligible on observation 15 (14 changes), then checks its thresholds on every observation.
+5. Monitor `CrossDetected` / `BandCrossDetected` / `RSIUpdated`, `Rebalanced`, `RebalanceDeferred`, pending direction, inventory, and fee
    liabilities. Pay transaction gas for periodic redemptions and any needed retries. Redemptions and
    explicit retries require a fresh PoolManager unlock and cannot be called inside an existing one.
 6. If liquidity or token transfers become unavailable, review the pending signal and limits before
