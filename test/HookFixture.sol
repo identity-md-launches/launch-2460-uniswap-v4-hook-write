@@ -32,12 +32,14 @@ abstract contract HookFixture is Test {
     address internal creator;
     address internal accumulator;
     address internal gasWallet;
+    address internal charity;
 
     function setUp() public virtual {
         treasury = makeAddr("treasury");
         creator = makeAddr("creator");
         accumulator = makeAddr("accumulator");
         gasWallet = makeAddr("gas wallet");
+        charity = makeAddr("charity router");
         manager = new PoolManager(address(this));
         router = new Swapper(manager);
         hook = _deployHook(creator, accumulator);
@@ -55,7 +57,7 @@ abstract contract HookFixture is Test {
         address target = address(uint160(0x1000000) | HookFlags.GOLDEN_CROSS);
         bytes memory creation = abi.encodePacked(
             type(GoldenCrossHook).creationCode,
-            abi.encode(manager, gasWallet, accumulator_, treasury, creator_)
+            abi.encode(manager, gasWallet, accumulator_, treasury, creator_, charity)
         );
         // Run the real constructor at a flag-valid address, including permission validation.
         vm.etch(target, creation);

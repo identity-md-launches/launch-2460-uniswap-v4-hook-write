@@ -35,11 +35,14 @@ contract FeeReceiver {
 
 contract NativeHookTest is HookFixture {
     FeeReceiver internal receiver;
+    FeeReceiver internal charityReceiver;
 
     function setUp() public override {
         treasury = makeAddr("treasury");
         accumulator = makeAddr("accumulator");
         gasWallet = makeAddr("gas wallet");
+        charityReceiver = new FeeReceiver();
+        charity = address(charityReceiver);
         receiver = new FeeReceiver();
         creator = address(receiver);
         manager = new PoolManager(address(this));
@@ -74,10 +77,11 @@ contract NativeHookTest is HookFixture {
         uint256 net = uint256(uint128(result.amount0()));
         uint256 creatorPart = hook.creatorFees(key.currency0);
         uint256 accumulatorPart = hook.accumulatorFees(key.currency0);
-        uint256 gross = net + creatorPart + accumulatorPart;
+        uint256 charityPart = hook.charityFees(key.currency0);
+        uint256 gross = net + creatorPart + accumulatorPart + charityPart;
         assertEq(net, address(router).balance - beforeNative);
-        assertEq(creatorPart, gross * 20 / 10000);
-        assertEq(creatorPart + accumulatorPart, gross * 25 / 10000);
+        assertEq(creatorPart, gross * 17 / 10000);
+        assertEq(creatorPart + accumulatorPart + charityPart, gross * 45 / 10000);
         vm.expectRevert();
         hook.redeemFees(key.currency0, true);
         assertEq(hook.creatorFees(key.currency0), creatorPart);
@@ -101,6 +105,29 @@ contract NativeHookTest is HookFixture {
         assertFalse(receiver.reentered());
         assertEq(creator.balance, creatorPart);
         assertEq(hook.creatorFees(key.currency0), 0);
+        _assertSettled();
+    }
+
+    function test_nativeCharityFailureIsIsolatedAndCannotReenterSwaps() public {
+        router.modify(key, -60000, 60000, 1e24);
+        charityReceiver.configure(true, address(0), "");
+        router.swap(key, false, 1e20);
+        uint256 charityAmount = hook.charityFees(key.currency0);
+        uint256 claims = manager.balanceOf(address(hook), key.currency0.toId());
+        vm.expectRevert();
+        hook.redeemCharityFees(key.currency0);
+        assertEq(hook.charityFees(key.currency0), charityAmount);
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), claims);
+        hook.redeemFees(key.currency0, true);
+        hook.redeemFees(key.currency0, false);
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), charityAmount);
+        charityReceiver.configure(false, address(router), abi.encodeCall(router.swap, (key, true, 1e18)));
+        hook.redeemCharityFees(key.currency0);
+        assertTrue(charityReceiver.attempted());
+        assertFalse(charityReceiver.reentered());
+        assertEq(charity.balance, charityAmount);
+        assertEq(hook.charityFees(key.currency0), 0);
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), 0);
         _assertSettled();
     }
 

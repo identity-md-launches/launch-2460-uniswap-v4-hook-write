@@ -14,15 +14,18 @@ contract MineHook {
         address gasWallet,
         address accumulator,
         address governanceTreasury,
-        address creatorWallet
+        address creatorWallet,
+        address charityRouter
     ) external view returns (address predicted, bytes32 salt, bytes32 initCodeHash) {
         require(create2Deployer != address(0), "Missing CREATE2 deployer");
         require(
             address(manager) != address(0) && gasWallet != address(0) && accumulator != address(0)
-                && governanceTreasury != address(0) && creatorWallet != address(0),
+                && governanceTreasury != address(0) && creatorWallet != address(0)
+                && charityRouter != address(0),
             "Missing constructor parameter"
         );
-        bytes memory args = abi.encode(manager, gasWallet, accumulator, governanceTreasury, creatorWallet);
+        bytes memory args =
+            abi.encode(manager, gasWallet, accumulator, governanceTreasury, creatorWallet, charityRouter);
         (predicted, salt) =
             HookMiner.find(create2Deployer, HookFlags.GOLDEN_CROSS, type(GoldenCrossHook).creationCode, args);
         initCodeHash = keccak256(abi.encodePacked(type(GoldenCrossHook).creationCode, args));

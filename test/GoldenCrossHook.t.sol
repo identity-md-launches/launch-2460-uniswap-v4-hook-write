@@ -21,12 +21,12 @@ contract GoldenCrossHookTest is HookFixture {
     using StateLibrary for IPoolManager;
 
     function test_deploysWithRealCreate2AndPermissionBits() public {
-        bytes memory args = abi.encode(manager, gasWallet, accumulator, treasury, creator);
+        bytes memory args = abi.encode(manager, gasWallet, accumulator, treasury, creator, charity);
         (address expected, bytes32 salt, bytes32 initCodeHash) =
-            new MineHook().run(address(this), manager, gasWallet, accumulator, treasury, creator);
+            new MineHook().run(address(this), manager, gasWallet, accumulator, treasury, creator, charity);
         assertEq(initCodeHash, keccak256(abi.encodePacked(type(GoldenCrossHook).creationCode, args)));
         GoldenCrossHook mined =
-            new GoldenCrossHook{salt: salt}(manager, gasWallet, accumulator, treasury, creator);
+            new GoldenCrossHook{salt: salt}(manager, gasWallet, accumulator, treasury, creator, charity);
         assertEq(address(mined), expected);
         assertTrue(HookFlags.matches(expected, HookFlags.GOLDEN_CROSS));
         Hooks.validateHookPermissions(mined, mined.getHookPermissions());
@@ -34,13 +34,14 @@ contract GoldenCrossHookTest is HookFixture {
         assertEq(mined.gasWallet(), gasWallet);
         assertEq(mined.accumulator(), accumulator);
         assertEq(mined.creatorWallet(), creator);
+        assertEq(mined.charityRouter(), charity);
         assertLt(address(mined).code.length, 24576);
     }
 
     function test_constructorRejectsEachZeroArgument() public {
         address target = address(uint160(0x2000000) | HookFlags.GOLDEN_CROSS);
-        address[5] memory args = [address(manager), gasWallet, accumulator, treasury, creator];
-        for (uint256 i; i < 5; ++i) {
+        address[6] memory args = [address(manager), gasWallet, accumulator, treasury, creator, charity];
+        for (uint256 i; i < 6; ++i) {
             address saved = args[i];
             args[i] = address(0);
             vm.etch(target, abi.encodePacked(type(GoldenCrossHook).creationCode, abi.encode(args)));
@@ -53,7 +54,76 @@ contract GoldenCrossHookTest is HookFixture {
 
     function test_constructorRejectsBadAddressFlags() public {
         vm.expectRevert();
-        new GoldenCrossHook(manager, gasWallet, accumulator, treasury, creator);
+        new GoldenCrossHook(manager, gasWallet, accumulator, treasury, creator, charity);
+    }
+
+    function test_constructorRejectsCharityAsHookOrManager() public {
+        address target = address(uint160(0x2000000) | HookFlags.GOLDEN_CROSS);
+        for (uint256 i; i < 2; ++i) {
+            address recipient = i == 0 ? target : address(manager);
+            vm.etch(
+                target,
+                abi.encodePacked(
+                    type(GoldenCrossHook).creationCode,
+                    abi.encode(manager, gasWallet, accumulator, treasury, creator, recipient)
+                )
+            );
+            (bool ok, bytes memory reason) = target.call("");
+            assertFalse(ok);
+            assertEq(bytes4(reason), GoldenCrossHook.InvalidRecipient.selector);
+        }
+    }
+
+    function test_charityRedemptionRejectsEmptyAndCannotRepeat() public {
+        vm.expectRevert(GoldenCrossHook.NothingToRedeem.selector);
+        hook.redeemCharityFees(key.currency1);
+        router.swap(key, true, 1e20);
+        uint256 amount = hook.charityFees(key.currency1);
+        assertGt(amount, 0);
+        vm.prank(makeAddr("charity keeper"));
+        hook.redeemCharityFees(key.currency1);
+        assertEq(token1.balanceOf(charity), amount);
+        assertEq(hook.charityFees(key.currency1), 0);
+        vm.expectRevert(GoldenCrossHook.NothingToRedeem.selector);
+        hook.redeemCharityFees(key.currency1);
+        _assertSettled();
+    }
+
+    function test_charityTransferFailureAndReentryPreserveAccounting() public {
+        router.swap(key, true, 1e20);
+        uint256 amount = hook.charityFees(key.currency1);
+        uint256 claims = manager.balanceOf(address(hook), key.currency1.toId());
+        token1.setRejectTransfers(true);
+        vm.expectRevert();
+        hook.redeemCharityFees(key.currency1);
+        assertEq(hook.charityFees(key.currency1), amount);
+        assertEq(manager.balanceOf(address(hook), key.currency1.toId()), claims);
+        token1.setRejectTransfers(false);
+        token1.setTransferCallback(address(hook), abi.encodeCall(hook.redeemCharityFees, (key.currency1)));
+        hook.redeemCharityFees(key.currency1);
+        assertTrue(token1.callbackAttempted());
+        assertFalse(token1.callbackSucceeded());
+        assertEq(token1.balanceOf(charity), amount);
+        assertEq(manager.balanceOf(address(hook), key.currency1.toId()), claims - amount);
+        _assertSettled();
+    }
+
+    function testFuzz_smallExactOutputsRoundAndConserveAllThreeFees(uint16 raw, bool zeroForOne) public {
+        uint256 requested = bound(raw, 1, 10000);
+        Currency output = zeroForOne ? key.currency1 : key.currency0;
+        BalanceDelta net = router.swapWithParams(
+            key, SwapParams(zeroForOne, int256(requested), zeroForOne ? Q96 / 2 : Q96 * 2)
+        );
+        assertEq(uint256(uint128(zeroForOne ? net.amount1() : net.amount0())), requested);
+        uint256 fee = manager.balanceOf(address(hook), output.toId());
+        uint256 gross = requested + fee;
+        assertEq(fee, gross * 45 / 10000);
+        assertEq(hook.creatorFees(output), gross * 17 / 10000);
+        assertEq(hook.charityFees(output), gross * 3 / 10000);
+        assertEq(hook.accumulatorFees(output), fee - gross * 17 / 10000 - gross * 3 / 10000);
+        assertGe(hook.accumulatorFees(output), gross * 25 / 10000);
+        assertLe(hook.accumulatorFees(output), gross * 25 / 10000 + 2);
+        _assertSettled();
     }
 
     function test_runtimeHasNoEscapeOpcodes() public view {
@@ -153,9 +223,10 @@ contract GoldenCrossHookTest is HookFixture {
         assertEq(uint256(uint128(zeroForOne ? delta.amount1() : delta.amount0())), requested);
         uint256 creatorPart = hook.creatorFees(outputCurrency);
         uint256 accumulatorPart = hook.accumulatorFees(outputCurrency);
-        uint256 fee = creatorPart + accumulatorPart;
-        assertEq(fee, (requested + fee) * 25 / 10000);
-        assertEq(creatorPart, (requested + fee) * 20 / 10000);
+        uint256 charityPart = hook.charityFees(outputCurrency);
+        uint256 fee = creatorPart + accumulatorPart + charityPart;
+        assertEq(fee, (requested + fee) * 45 / 10000);
+        assertEq(creatorPart, (requested + fee) * 17 / 10000);
         Currency inputCurrency = zeroForOne ? key.currency0 : key.currency1;
         assertEq(hook.creatorFees(inputCurrency), 0);
         assertEq(hook.accumulatorFees(inputCurrency), 0);
@@ -185,7 +256,7 @@ contract GoldenCrossHookTest is HookFixture {
         _assertSettled();
     }
 
-    function testFuzz_feeIsExactly25BpsOfGrossOutput(bool zeroForOne, uint96 input) public {
+    function testFuzz_feeIsExactly45BpsOfGrossOutput(bool zeroForOne, uint96 input) public {
         uint256 amount = bound(input, 1e6, 1e22);
         Currency output = zeroForOne ? key.currency1 : key.currency0;
         uint256 managerBefore = output.balanceOf(address(manager));
@@ -193,11 +264,13 @@ contract GoldenCrossHookTest is HookFixture {
         uint256 netOutput = uint256(uint128(zeroForOne ? net.amount1() : net.amount0()));
         uint256 creatorPart = hook.creatorFees(output);
         uint256 accumulatorPart = hook.accumulatorFees(output);
-        uint256 fee = creatorPart + accumulatorPart;
+        uint256 charityPart = hook.charityFees(output);
+        uint256 fee = creatorPart + accumulatorPart + charityPart;
         uint256 gross = netOutput + fee;
-        assertEq(fee, gross * 25 / 10000);
-        assertEq(creatorPart, gross * 20 / 10000);
-        assertEq(accumulatorPart, fee - creatorPart);
+        assertEq(fee, gross * 45 / 10000);
+        assertEq(creatorPart, gross * 17 / 10000);
+        assertEq(charityPart, gross * 3 / 10000);
+        assertEq(accumulatorPart, fee - creatorPart - charityPart);
         assertEq(managerBefore - output.balanceOf(address(manager)), netOutput);
         assertEq(manager.balanceOf(address(hook), output.toId()), fee);
         assertEq(output.balanceOf(address(hook)), 0, "claims are not strategy inventory");
@@ -212,7 +285,11 @@ contract GoldenCrossHookTest is HookFixture {
         assertGt(accumulatorPart, 0);
         vm.prank(makeAddr("permissionless caller"));
         hook.redeemFees(key.currency1, true);
+        uint256 charityPart = hook.charityFees(key.currency1);
         hook.redeemFees(key.currency1, false);
+        hook.redeemCharityFees(key.currency1);
+        assertEq(token1.balanceOf(charity), charityPart);
+        assertEq(hook.charityFees(key.currency1), 0);
         assertEq(token1.balanceOf(creator), creatorPart);
         assertEq(token1.balanceOf(accumulator), accumulatorPart);
         assertEq(manager.balanceOf(address(hook), key.currency1.toId()), 0);
@@ -255,7 +332,9 @@ contract GoldenCrossHookTest is HookFixture {
         uint256 tradeEvents;
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].emitter != address(hook)) continue;
-            if (logs[i].topics[0] == keccak256("FeeAccrued(bytes32,address,uint256,uint256)")) ++feeEvents;
+            if (logs[i].topics[0] == keccak256("FeeAccrued(bytes32,address,uint256,uint256,uint256)")) {
+                ++feeEvents;
+            }
             if (logs[i].topics[0] == keccak256("Rebalanced(bytes32,bool,uint256,uint256,uint256)")) {
                 ++tradeEvents;
             }
@@ -486,8 +565,8 @@ contract GoldenCrossHookTest is HookFixture {
     function test_saltMinerRequiresExplicitDeploymentInputs() public {
         MineHook miner = new MineHook();
         vm.expectRevert("Missing CREATE2 deployer");
-        miner.run(address(0), manager, gasWallet, accumulator, treasury, creator);
+        miner.run(address(0), manager, gasWallet, accumulator, treasury, creator, charity);
         vm.expectRevert("Missing constructor parameter");
-        miner.run(address(this), manager, gasWallet, accumulator, treasury, address(0));
+        miner.run(address(this), manager, gasWallet, accumulator, treasury, address(0), charity);
     }
 }

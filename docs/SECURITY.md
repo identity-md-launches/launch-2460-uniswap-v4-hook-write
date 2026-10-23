@@ -15,7 +15,7 @@ from a router, an EOA, or the manager with no outstanding operation fails.
 
 `beforeSwapReturnDelta` is enabled solely to gross up exact-output trades by a bounded fee. It is
 zero for exact-input trades. For exact output its specified delta is positive, at most
-`floor(netRequested / 399)`, and its unspecified delta is zero. It increases the pool's requested
+`floor(netRequested * 45 / 9955)`, and its unspecified delta is zero. It increases the pool's requested
 output and never consumes, replaces, or cancels the swap. There is no NoOp route, caller-supplied
 custom settlement, or administrative ability to change this calculation. A partial exact-output
 fill reverts, so a reserved fee is never charged against an incomplete output.
@@ -29,7 +29,7 @@ The deployment factory and transaction origin have no implicit rights. Router `s
 
 ## Accounting review
 
-Let `O` be gross external output and `F = floor(O * 25 / 10000)`.
+Let `O` be gross external output and `F = floor(O * 45 / 10000)`.
 
 | Operation | Hook PoolManager delta | Balancing action |
 | --- | --- | --- |
@@ -40,10 +40,11 @@ Let `O` be gross external output and `F = floor(O * 25 / 10000)`.
 
 For exact input the fee delta is returned by `afterSwap`. For exact output the specified delta is
 reserved by `beforeSwap`, while the afterSwap return is zero. If `N` is requested net output,
-`F = floor(N / 399)` and `O = N + F` imply `floor(O / 400) = F`. Thus both modes capture exactly
+`F = floor(N * 45 / 9955)` and `O = N + F` imply `floor(O * 45 / 10000) = F`: the
+remainder `N*45 - F*9955` lies in [0, 9954], and `O*45 = F*10000 + remainder`. Thus both modes capture exactly
 the same output fee formula without charging input or using floating-point arithmetic.
 
-Creator and accumulator liabilities sum to the claims minted for fees, per currency. Those claims
+Creator, accumulator, and charity liabilities sum to the claims minted for fees, per currency. Those claims
 are never strategy balances. User swaps see net output and settle their own returned deltas;
 rebalances settle only the hook's returned deltas. All four paths balance to zero at unlock end.
 Real PoolManager integration tests and stateful invariants check this rather than assuming that a
@@ -62,7 +63,7 @@ mock swap implies valid settlement.
   restores its pool movement and inventory together, while keeping the triggering user trade.
   A partial fill retains input and a pending direction; an opposite crossover replaces that signal.
 - Fee redemption clears the selected liability before external transfers. A revert restores it
-  and the burned claims. Creator and accumulator redemptions are independent.
+  and the burned claims. Creator, accumulator, and charity redemptions are independent.
 - Sums fit in uint256: 200 uint160 prices need fewer than 168 bits. The scaled short sum also fits.
   Returned fee deltas are bounded by the positive int128 gross output. Exact-output gross amounts
   are explicitly bounded before casting. Rebalance input is capped to int128.max and only a
@@ -104,11 +105,34 @@ claim/liability equality, and complete PoolManager settlement after randomized o
 `forge build`, `forge test`, `forge fmt --check`, and the real `npx hardhat compile` are the local
 validation commands. Native compiler versions and bytecode parity are also checked locally.
 Compiler/Foundry lint heuristics may flag guarded external calls or bounded casts; the actual paths
-and bounds are explained above. Slither, Mythril, formal verification, chain forks, external audits,
-and production gas benchmarking have not been performed or represented as passed.
+and bounds are explained above. Slither was run for this revision; see [REVIEW.md](../REVIEW.md) for detector dispositions.
+Mythril, formal verification, chain forks, external audits, and production gas benchmarking have not
+been performed or represented as passed.
 
-Before release, the deploying operator must verify the corrected published PoolManager address,
+Before release, the deploying operator must resolve the malformed supplied PoolManager address and verify the intended full address,
 chain 4663/Cancun compatibility, currency transfer behavior, fee-recipient reception, CREATE2
 deployer and salt, intended PoolKey and liquidity, treasury policy for both limits, and monitoring.
 An independent reviewer should specifically challenge oracle manipulation, the exact-output fee
 reservation, failure rollback, and cross-pool inventory isolation.
+
+## Bollinger arithmetic and signal review
+
+Bollinger alone replaces the signal with a 20-slot ring, exact integer SMA, population variance,
+and two standard deviations. It keeps the existing execution, settlement, permission, and isolation
+patterns. The calculation uses the existing square-root-price basis; changing to arithmetic token
+exchange prices would be a different deployment assumption. The newest sample participates in its
+own band. The 20th establishes a baseline; same-side excursions do not repeatedly retrigger.
+
+Centering all samples by their minimum is variance invariant. For spans at most 123 bits the
+variance numerator fits: `N² * maxOffset² < 400 * 2^246 < 2^255`. Larger spans are normalized to
+123 bits with a common shift, at most 37 bits for uint160 inputs. This avoids intermediate overflow
+without imposing a pool price cap. Integer sigma rounds down before restoring the scale; precision
+near a band is finite and documented. SMA uses unscaled samples. Upper bands use uint256 so that
+`SMA + 2*sigma` cannot wrap/truncate. Negative lower bands become zero, consistent with nonnegative
+price samples. Library functions are internal and have no deployment/link references.
+
+The charity route mirrors other fee claims. The new action is appended to the unlock enum,
+preserving the original action numbers; callback commitments, CEI, and the guard apply equally.
+Native recipient rejection rolls back its redemption only; ERC-20 and native callback attempts
+cannot reenter swaps or redemptions. Three-way fee liabilities equal the manager's minted claims.
+The router must distribute received funds itself: this hook does not assume a donation method ABI.
